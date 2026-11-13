@@ -39,6 +39,17 @@ export async function openRouterFetch<T>(
   const apiKey = options.apiKey ?? requireEnv("OPENROUTER_API_KEY");
   const baseUrl = options.baseUrl ?? OPENROUTER_BASE_URL;
 
+  // Catch placeholder keys early. A placeholder produces a confusing 401
+  // from the provider that looks like a credential problem rather than a
+  // setup problem.
+  if (!options.apiKey && !apiKey.startsWith("sk-or-")) {
+    throw new OpenRouterError(
+      `OPENROUTER_API_KEY does not look like a valid OpenRouter key (expected it to start with "sk-or-"). ` +
+        `Set a real key in .env.local or export it in your shell before starting the dev server.`,
+      401,
+    );
+  }
+
   const response = await fetch(`${baseUrl}${path}`, {
     method: options.method ?? "POST",
     headers: {
@@ -54,6 +65,14 @@ export async function openRouterFetch<T>(
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
+    if (response.status === 401 || response.status === 403) {
+      throw new OpenRouterError(
+        `OpenRouter rejected the API key (${response.status}) for ${path}. ` +
+          `Check that OPENROUTER_API_KEY is set to a valid key and that it has credit.`,
+        response.status,
+        text,
+      );
+    }
     throw new OpenRouterError(
       `OpenRouter request failed (${response.status}) for ${path}: ${text.slice(0, 500)}`,
       response.status,

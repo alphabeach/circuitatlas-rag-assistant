@@ -39,6 +39,8 @@ export type Citation = {
   content: string;
   similarity: number;
   ordinal: number;
+  /** Source chunk metadata. PDF chunks include a `page` number. */
+  metadata: Record<string, unknown>;
 };
 
 export type IngestResult = {

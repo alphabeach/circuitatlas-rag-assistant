@@ -65,15 +65,26 @@ export const RETRIEVAL = {
 } as const;
 
 export const INGEST = {
-  /** Max characters per accepted file. Guards against pathological input. */
+  /** Max characters per accepted text file. Guards against pathological input. */
   MAX_FILE_CHARS: 2_000_000,
   /** Embeddings are requested in batches of this size. */
   EMBED_BATCH_SIZE: 64,
-  ACCEPTED_EXTENSIONS: [".md", ".markdown", ".txt"] as const,
+  /**
+   * Max bytes per uploaded file.
+   *
+   * Vercel caps request bodies at 4.5 MB, so anything larger must be
+   * uploaded to Supabase Storage directly rather than through the API
+   * route. 4 MB leaves headroom for multipart framing overhead.
+   */
+  MAX_FILE_BYTES: 4 * 1024 * 1024,
+  /** Max pages accepted from a PDF. */
+  MAX_PDF_PAGES: 500,
+  ACCEPTED_EXTENSIONS: [".md", ".markdown", ".txt", ".pdf"] as const,
   ACCEPTED_MIME_TYPES: [
     "text/markdown",
     "text/plain",
     "text/x-markdown",
+    "application/pdf",
   ] as const,
 } as const;
 

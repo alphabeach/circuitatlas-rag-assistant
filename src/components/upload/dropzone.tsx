@@ -5,6 +5,7 @@ import * as React from "react";
 import { useDropzone } from "react-dropzone";
 
 import { Button } from "@/components/ui/button";
+import { INGEST } from "@/lib/constants";
 import { cn, formatBytes } from "@/lib/utils";
 
 export type StagedFile = {
@@ -60,8 +61,9 @@ export function Dropzone({
       accept: {
         "text/markdown": [".md", ".markdown"],
         "text/plain": [".txt"],
+        "application/pdf": [".pdf"],
       },
-      maxSize: 5 * 1024 * 1024,
+      maxSize: INGEST.MAX_FILE_BYTES,
       disabled,
     });
 
@@ -91,7 +93,8 @@ export function Dropzone({
               : "Drag SOPs here, or click to browse"}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Markdown (.md) and plain text (.txt). PDF is not supported yet.
+            PDF (.pdf), Markdown (.md), and plain text (.txt). Scanned PDFs
+            without a text layer are not supported.
           </p>
         </div>
       </div>
@@ -100,7 +103,8 @@ export function Dropzone({
         <p className="text-xs text-destructive">
           {fileRejections.length} file
           {fileRejections.length === 1 ? " was" : "s were"} rejected. Only
-          Markdown and text files are accepted.
+          PDF, Markdown, and text files under{" "}
+          {formatBytes(INGEST.MAX_FILE_BYTES)} are accepted.
         </p>
       )}
 

@@ -146,6 +146,7 @@ async function attachDocumentInfo(chunks: MatchedChunk[]): Promise<Citation[]> {
       content: chunk.content,
       similarity: chunk.similarity,
       ordinal: index + 1,
+      metadata: chunk.metadata,
     };
   });
 }

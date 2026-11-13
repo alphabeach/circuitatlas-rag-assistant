@@ -1,6 +1,10 @@
 import { INGEST } from "@/lib/constants";
 import { ingestDocument, IngestError } from "@/lib/rag/ingest";
-import { UnsupportedFormatError, acceptedExtensions } from "@/lib/parsers";
+import {
+  UnsupportedFormatError,
+  PdfParseError,
+  acceptedExtensions,
+} from "@/lib/parsers";
 
 /**
  * POST /api/ingest
@@ -42,7 +46,14 @@ export async function POST(request: Request) {
 
   for (const file of files) {
     try {
-      const raw = await file.text();
+      const isPdf =
+        file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+
+      // PDFs are read as bytes; text formats are read as UTF-8 text.
+      const raw = isPdf
+        ? new Uint8Array(await file.arrayBuffer())
+        : await file.text();
+
       const result = await ingestDocument(raw, file.name, {
         mimeType: file.type || undefined,
         tags,
@@ -56,7 +67,9 @@ export async function POST(request: Request) {
       failures.push({
         filename: file.name,
         error:
-          error instanceof UnsupportedFormatError || error instanceof IngestError
+          error instanceof UnsupportedFormatError ||
+          error instanceof IngestError ||
+          error instanceof PdfParseError
             ? error.message
             : error instanceof Error
               ? error.message

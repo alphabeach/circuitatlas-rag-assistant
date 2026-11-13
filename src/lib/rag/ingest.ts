@@ -25,11 +25,11 @@ export class IngestError extends Error {
 }
 
 export async function ingestDocument(
-  raw: string,
+  input: string | Uint8Array,
   filename: string,
   options: { mimeType?: string; title?: string; tags?: string[] } = {},
 ): Promise<IngestResult> {
-  const parsed = parseDocument(raw, filename);
+  const parsed = await parseDocument(input, filename, options.mimeType);
   const title = options.title?.trim() || parsed.title;
   const tags = options.tags?.length ? options.tags : parsed.tags;
 
@@ -59,7 +59,7 @@ export async function ingestDocument(
   //    chunks are what make the document searchable.
   let storagePath: string | null = null;
   try {
-    storagePath = await storeOriginalFile(document.id, raw, filename);
+    storagePath = await storeOriginalFile(document.id, input, filename);
     await supabase
       .from("protocol_documents")
       .update({ storage_path: storagePath })
@@ -71,39 +71,50 @@ export async function ingestDocument(
     );
   }
 
-  // 3. Embed the chunks in batches.
-  const embeddings: number[][] = [];
-  for (let i = 0; i < parsed.chunks.length; i += INGEST.EMBED_BATCH_SIZE) {
-    const batch = parsed.chunks.slice(i, i + INGEST.EMBED_BATCH_SIZE);
-    const vectors = await embedBatch(batch.map((chunk) => chunk.content));
-    embeddings.push(...vectors);
-  }
+  // From here on, any failure must roll back the document row. Otherwise a
+  // failed embed leaves an entry in protocol_documents with a chunk_count
+  // but no actual chunks - a document that appears ingested but can never
+  // be retrieved.
+  try {
+    // 3. Embed the chunks in batches.
+    const embeddings: number[][] = [];
+    for (
+      let i = 0;
+      i < parsed.chunks.length;
+      i += INGEST.EMBED_BATCH_SIZE
+    ) {
+      const batch = parsed.chunks.slice(i, i + INGEST.EMBED_BATCH_SIZE);
+      const vectors = await embedBatch(batch.map((chunk) => chunk.content));
+      embeddings.push(...vectors);
+    }
 
-  // 4. Insert the chunks.
-  const rows = parsed.chunks.map((chunk, index) => ({
-    document_id: document.id,
-    content: chunk.content,
-    metadata: {
-      ...chunk.metadata,
-      filename,
-      title,
-      tags,
-      ordinal: chunk.metadata.ordinal,
-    },
-    embedding: embeddings[index],
-    char_count: chunk.content.length,
-  }));
+    // 4. Insert the chunks.
+    const rows = parsed.chunks.map((chunk, index) => ({
+      document_id: document.id,
+      content: chunk.content,
+      metadata: {
+        ...chunk.metadata,
+        filename,
+        title,
+        tags,
+        ordinal: chunk.metadata.ordinal,
+      },
+      embedding: embeddings[index],
+      char_count: chunk.content.length,
+    }));
 
-  const { error: chunkError } = await supabase
-    .from("protocol_chunks")
-    .insert(rows);
+    const { error: chunkError } = await supabase
+      .from("protocol_chunks")
+      .insert(rows);
 
-  if (chunkError) {
-    // Roll back the document so we do not leave a dangling registry entry.
+    if (chunkError) {
+      throw new IngestError(
+        `Failed to store ${rows.length} chunk(s): ${chunkError.message}`,
+      );
+    }
+  } catch (error) {
     await supabase.from("protocol_documents").delete().eq("id", document.id);
-    throw new IngestError(
-      `Failed to store ${rows.length} chunk(s): ${chunkError.message}`,
-    );
+    throw error;
   }
 
   return {
@@ -117,20 +128,23 @@ export async function ingestDocument(
 
 async function storeOriginalFile(
   documentId: string,
-  raw: string,
+  input: string | Uint8Array,
   filename: string,
 ): Promise<string> {
   const { env } = await import("@/lib/env");
   const bucket = env().SUPABASE_STORAGE_BUCKET;
   const path = `${documentId}/${slugify(filename) || "document"}`;
 
+  const body =
+    typeof input === "string"
+      ? new Blob([input], { type: "text/markdown" })
+      : new Blob([input as BlobPart], { type: "application/pdf" });
+
   const supabase = getAdminClient();
-  const { error } = await supabase.storage
-    .from(bucket)
-    .upload(path, new Blob([raw], { type: "text/markdown" }), {
-      upsert: true,
-      contentType: "text/markdown",
-    });
+  const { error } = await supabase.storage.from(bucket).upload(path, body, {
+    upsert: true,
+    contentType: body.type,
+  });
 
   if (error) throw new Error(error.message);
 

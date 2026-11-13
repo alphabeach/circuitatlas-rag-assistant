@@ -26,6 +26,14 @@ export function SourceCard({
 }) {
   const confidence = Math.round(citation.similarity * 100);
 
+  // PDF chunks carry a page number, which is more useful for verification
+  // than the filename alone.
+  const page =
+    typeof citation.metadata?.page === "number" ? citation.metadata.page : null;
+  const pageLabel = page
+    ? `${citation.filename} - page ${page}`
+    : null;
+
   return (
     <div
       className={cn(
@@ -52,10 +60,19 @@ export function SourceCard({
             </p>
           )}
 
-          <p className="mt-1 flex items-center gap-1.5 pl-7 text-xs text-muted-foreground">
-            <FileText className="size-3 shrink-0" />
-            {citation.filename}
-          </p>
+          {pageLabel && (
+            <p className="mt-1 flex items-center gap-1.5 pl-7 text-xs text-muted-foreground">
+              <FileText className="size-3 shrink-0" />
+              {pageLabel}
+            </p>
+          )}
+
+          {!pageLabel && (
+            <p className="mt-1 flex items-center gap-1.5 pl-7 text-xs text-muted-foreground">
+              <FileText className="size-3 shrink-0" />
+              {citation.filename}
+            </p>
+          )}
         </div>
 
         <div className="shrink-0 text-right">

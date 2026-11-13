@@ -3,18 +3,18 @@ import "server-only";
 import matter from "gray-matter";
 import { INGEST } from "@/lib/constants";
 import { chunkMarkdown, chunkText, type Chunk } from "@/lib/rag/chunk";
+import { parsePdf, PdfParseError } from "@/lib/parsers/pdf";
 
 /**
  * Parsing layer.
  *
- * Markdown (.md) and plain text (.txt) only.
+ * Supported: Markdown (.md), plain text (.txt), PDF (.pdf).
  *
- * PDF ingestion is deliberately out of scope for the MVP. The reason is
- * retrieval quality, not serverless capability: PDF text extraction yields
- * a flat stream where you cannot tell a procedural step from a safety
- * warning, so chunks map to arbitrary slices of a page. Markdown gives real
- * section boundaries, which means every retrieved chunk corresponds to a
- * named SOP section and the citation drawer can show which one.
+ * Markdown is the best format for retrieval because headings become real
+ * chunk boundaries, but PDF is supported for the practical reason that
+ * existing SOPs are PDFs. PDF chunks are page-aware (a citation points at a
+ * page) and use heuristic heading detection to recover section boundaries
+ * where the text layer allows it.
  *
  * This is a registry. Adding a format later means adding one file and
  * registering it below - no changes to the ingest route.
@@ -31,16 +31,17 @@ export type ParsedDocument = {
 export class UnsupportedFormatError extends Error {
   constructor(filename: string, accepted: readonly string[]) {
     super(
-      `Unsupported file type: ${filename}. Accepted formats: ${accepted.join(", ")}. ` +
-        `Convert the document to Markdown or plain text and try again.`,
+      `Unsupported file type: ${filename}. Accepted formats: ${accepted.join(", ")}.`,
     );
     this.name = "UnsupportedFormatError";
   }
 }
 
-type Parser = (raw: string, filename: string) => ParsedDocument;
+export { PdfParseError };
 
-const markdownParser: Parser = (raw, filename) => {
+type TextParser = (raw: string, filename: string) => ParsedDocument;
+
+const markdownParser: TextParser = (raw, filename) => {
   const { data, content } = matter(raw);
 
   const frontmatterTitle =
@@ -52,7 +53,8 @@ const markdownParser: Parser = (raw, filename) => {
   // The first H1 in the body is a better title than the filename when the
   // frontmatter does not supply one.
   const bodyHeading = /^#\s+(.+)$/m.exec(content)?.[1]?.trim();
-  const title = frontmatterTitle ?? bodyHeading ?? filename.replace(/\.[^.]+$/, "");
+  const title =
+    frontmatterTitle ?? bodyHeading ?? filename.replace(/\.[^.]+$/, "");
 
   return {
     title,
@@ -66,7 +68,7 @@ const markdownParser: Parser = (raw, filename) => {
   };
 };
 
-const textParser: Parser = (raw, filename) => {
+const textParser: TextParser = (raw, filename) => {
   const content = raw.trim();
   const firstLine = content.split("\n")[0]?.trim();
   const title =
@@ -83,40 +85,71 @@ const textParser: Parser = (raw, filename) => {
   };
 };
 
-const PARSERS: Record<string, Parser> = {
+const TEXT_PARSERS: Record<string, TextParser> = {
   ".md": markdownParser,
   ".markdown": markdownParser,
   ".txt": textParser,
 };
 
-export function acceptedExtensions(): string[] {
-  return [...INGEST.ACCEPTED_EXTENSIONS];
-}
-
 /**
  * Parses raw file content into a document ready for chunking and storage.
+ *
+ * Handles binary (PDF) and text formats. Binary content must be passed as
+ * bytes; text content as a string.
  */
-export function parseDocument(raw: string, filename: string): ParsedDocument {
+export async function parseDocument(
+  input: string | Uint8Array,
+  filename: string,
+  mimeType?: string,
+): Promise<ParsedDocument> {
   const extension = extensionOf(filename);
+  const isPdf =
+    extension === ".pdf" || mimeType === "application/pdf";
 
-  const parser = PARSERS[extension];
+  if (isPdf) {
+    if (typeof input === "string") {
+      throw new PdfParseError(
+        "PDF content must be provided as binary data, not as text.",
+      );
+    }
+
+    const chunks = await parsePdf(input);
+
+    return {
+      title: filename.replace(/\.[^.]+$/, ""),
+      content: chunks.map((chunk) => chunk.content).join("\n\n"),
+      chunks,
+      tags: [],
+      metadata: { pageCount: chunks.length, format: "pdf" },
+    };
+  }
+
+  const parser = TEXT_PARSERS[extension];
   if (!parser) {
     throw new UnsupportedFormatError(filename, INGEST.ACCEPTED_EXTENSIONS);
   }
 
-  if (raw.length > INGEST.MAX_FILE_CHARS) {
+  if (typeof input !== "string") {
+    throw new UnsupportedFormatError(filename, INGEST.ACCEPTED_EXTENSIONS);
+  }
+
+  if (input.length > INGEST.MAX_FILE_CHARS) {
     throw new Error(
-      `File is too large (${raw.length} characters, limit ${INGEST.MAX_FILE_CHARS}).`,
+      `File is too large (${input.length} characters, limit ${INGEST.MAX_FILE_CHARS}).`,
     );
   }
 
-  const parsed = parser(raw, filename);
+  const parsed = parser(input, filename);
 
   if (parsed.chunks.length === 0) {
     throw new Error(`No indexable content found in ${filename}.`);
   }
 
   return parsed;
+}
+
+export function acceptedExtensions(): string[] {
+  return [...INGEST.ACCEPTED_EXTENSIONS];
 }
 
 export function extensionOf(filename: string): string {
