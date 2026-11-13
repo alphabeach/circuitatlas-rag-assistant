@@ -1,7 +1,7 @@
 import "server-only";
 
 import { INGEST } from "@/lib/constants";
-import { embedBatch } from "@/lib/openrouter/embeddings";
+import { embedBatch } from "@/lib/ai";
 import { parseDocument } from "@/lib/parsers";
 import { getAdminClient } from "@/lib/supabase/admin";
 import { slugify } from "@/lib/utils";
@@ -29,7 +29,13 @@ export async function ingestDocument(
   filename: string,
   options: { mimeType?: string; title?: string; tags?: string[] } = {},
 ): Promise<IngestResult> {
-  const parsed = await parseDocument(input, filename, options.mimeType);
+  // PDF.js detaches the ArrayBuffer it parses (it transfers ownership to a
+  // worker), which leaves the original bytes unusable. Parse a copy so the
+  // original can still be uploaded to storage afterwards.
+  const bytes =
+    typeof input === "string" ? input : new Uint8Array(input);
+
+  const parsed = await parseDocument(bytes, filename, options.mimeType);
   const title = options.title?.trim() || parsed.title;
   const tags = options.tags?.length ? options.tags : parsed.tags;
 
@@ -138,7 +144,9 @@ async function storeOriginalFile(
   const body =
     typeof input === "string"
       ? new Blob([input], { type: "text/markdown" })
-      : new Blob([input as BlobPart], { type: "application/pdf" });
+      : // Copy again: the storage client may also take ownership of the
+        // buffer, and a detached buffer cannot be sliced.
+        new Blob([new Uint8Array(input)], { type: "application/pdf" });
 
   const supabase = getAdminClient();
   const { error } = await supabase.storage.from(bucket).upload(path, body, {

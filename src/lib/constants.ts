@@ -9,14 +9,53 @@
  * only to catch the "nothing relevant exists at all" case.
  */
 
-export const EMBEDDING_MODEL =
+/**
+ * Model ids are provider-specific.
+ *
+ * Gemini is the default provider because the AI Studio free tier needs no
+ * credit card. OpenRouter is the alternative.
+ */
+
+/** Gemini embedding model. */
+export const GEMINI_EMBEDDING_MODEL =
+  process.env.GEMINI_EMBEDDING_MODEL ?? "gemini-embedding-001";
+
+/**
+ * Gemini chat model.
+ *
+ * `gemini-4-hydrogen` is the current flash-tier model on the free tier.
+ * The 3.x-flash models return 503 (free-tier capacity) for new accounts,
+ * and 2.5-flash is retired for new users.
+ */
+export const GEMINI_CHAT_MODEL =
+  process.env.GEMINI_CHAT_MODEL ?? "gemini-4-hydrogen";
+
+/** OpenRouter embedding model. */
+export const OPENROUTER_EMBEDDING_MODEL =
   process.env.OPENROUTER_EMBEDDING_MODEL ?? "openai/text-embedding-3-small";
 
-/** Must match the `vector(N)` dimension used in the pgvector column. */
-export const EMBEDDING_DIMENSIONS = 1536;
+/** OpenRouter chat model. */
+export const OPENROUTER_CHAT_MODEL =
+  process.env.OPENROUTER_CHAT_MODEL ?? "anthropic/claude-3.5-sonnet";
 
-export const CHAT_MODEL =
-  process.env.OPENROUTER_CHAT_MODEL ?? "anthropic/claude-sonnet-4.5";
+/**
+ * Vector dimension.
+ *
+ * Must match the `vector(N)` column in the pgvector schema.
+ *
+ * This is tied to the active provider: 768 for Gemini's
+ * gemini-embedding-001 with output_dimensionality=768 (Matryoshka-trained,
+ * so 768 loses almost no retrieval quality against 3072 - MTEB 67.99 vs
+ * 68.17 - while halving the column), and 1536 for OpenAI's
+ * text-embedding-3-small.
+ *
+ * Switching providers changes the embedding space, so it requires a schema
+ * migration and a full re-embed. See
+ * supabase/migrations/20240101000007_embedding_dimension_768.sql.
+ */
+export const EMBEDDING_DIMENSIONS = Number(
+  process.env.EMBEDDING_DIMENSIONS ?? 768,
+);
 
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
@@ -46,22 +85,33 @@ export const RETRIEVAL = {
   /**
    * Absolute floor on the best hit for the query.
    *
-   * This is the backstop for "nothing in the corpus is relevant". It has
-   * to sit above the score an unrelated pair typically receives and below
-   * the score a genuinely related pair typically receives. For
-   * text-embedding-3-small those land around 0.15-0.35 (unrelated) and
-   * 0.50-0.85 (related), so 0.35 is the midpoint.
+   * MEASURED, not guessed. `npx tsx scripts/calibrate-retrieval.ts` against
+   * the Gemini embeddings produced:
    *
-   * Set this too low and every query returns something, which defeats the
-   * abstention path. Set it too high and real matches get dropped.
+   *   weakest TRUE top score   0.715
+   *   strongest NOISE score    0.637
+   *
+   * so the usable window is (0.637, 0.715]. 0.65 sits just above the noise
+   * ceiling and comfortably below the weakest true match.
+   *
+   * Note how narrow that window is: dense embedding models share a common
+   * direction, so unrelated text still scores around 0.6. The absolute floor
+   * is therefore a coarse filter, not a precise one - the relative rule
+   * below and the model's own abstention do the real work.
+   *
+   * Re-run the calibration script once the real corpus is loaded; these
+   * numbers came from six chunks of a single SOP.
    */
-  ABSOLUTE_FLOOR: 0.35,
+  ABSOLUTE_FLOOR: 0.65,
   /**
    * Relative band. A chunk is kept when it is within this distance of the
    * best-scoring hit for *this* query. This is what drops weak siblings
    * without touching strong ones.
+   *
+   * Measured average top-2 margin was 0.084, so 0.10 keeps the top hit and
+   * its close siblings.
    */
-  RELATIVE_DELTA: 0.12,
+  RELATIVE_DELTA: 0.1,
 } as const;
 
 export const INGEST = {

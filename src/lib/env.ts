@@ -15,6 +15,7 @@ const serverSchema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1).optional(),
   OPENROUTER_API_KEY: z.string().min(1).optional(),
   OPENAI_API_KEY: z.string().min(1).optional(),
+  GEMINI_API_KEY: z.string().min(1).optional(),
   EMBEDDING_FALLBACK_OPENAI: z.string().optional(),
   SUPABASE_STORAGE_BUCKET: z.string().min(1).default("protocol-files"),
 });
@@ -31,6 +32,7 @@ export function env(): ServerEnv {
       SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
       OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
       OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+      GEMINI_API_KEY: process.env.GEMINI_API_KEY,
       EMBEDDING_FALLBACK_OPENAI: process.env.EMBEDDING_FALLBACK_OPENAI,
       SUPABASE_STORAGE_BUCKET: process.env.SUPABASE_STORAGE_BUCKET,
     });

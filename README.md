@@ -12,9 +12,30 @@ retrieved chunk that supports it.
 | Framework | Next.js 16 (App Router), React 19, TypeScript |
 | Hosting | Vercel (serverless) |
 | Database | Supabase Postgres + `pgvector` |
-| Embeddings | OpenRouter `openai/text-embedding-3-small` (1536-dim) |
-| Generation | OpenRouter `anthropic/claude-sonnet-4.5` |
+| Embeddings | Gemini `gemini-embedding-001` (768-dim) — AI Studio free tier |
+| Generation | Gemini `gemini-4-hydrogen` — AI Studio free tier |
 | UI | Tailwind CSS v4, Radix primitives, `next-themes` |
+
+### Why Gemini and not OpenRouter
+
+OpenRouter's free models work without credits, but the pool is capped at
+**50 requests per day** on a zero-credit account (measured from the
+`x-ratelimit-limit` response header). Ingesting one 82-chunk PDF plus a
+day of queries blows through that immediately. Adding $10 of credit raises
+the cap to 1000 free requests per day, which does work.
+
+Google's AI Studio free tier needs no credit card and has far higher
+quotas, so it is the default provider. OpenRouter remains available via
+`AI_PROVIDER=openrouter` for anyone who wants a different model.
+
+Two provider-specific notes that cost real debugging time:
+
+- Gemini's `embedContent` endpoint **aggregates** multiple input parts into
+  a single vector. Batching therefore requires `batchEmbedContents`, which
+  returns one embedding per request.
+- Gemini's SSE frames are separated by `\r\n\r\n`. Splitting the stream on
+  `"\n\n"` silently yields zero frames, which produces an empty answer with
+  no error. The client normalises CRLF to LF before splitting.
 
 ## Quick start
 
@@ -52,29 +73,43 @@ about ten seconds and the result is permanently more searchable.
 The interesting problem with this system is not the vector database - it is
 deciding which retrieved chunks are relevant enough to send to the model.
 
-`text-embedding-3-small` produces **anisotropic** vectors. All vectors share a
+Dense embedding models produce **anisotropic** vectors. All vectors share a
 dominant direction, so raw cosine similarity has a high floor: unrelated
-English text still scores roughly 0.6-0.8. A naive `WHERE similarity > 0.5`
-filter therefore either returns nothing or returns everything, and neither
-outcome is stable across queries.
+English text still scores around 0.6. Measured on the Gemini embeddings,
+an out-of-domain question ("what is the corporate holiday policy") scored
+**0.637** against a chunk about cell lysis, while the weakest correct match
+scored **0.715**.
 
-The fix is to make relevance **relative** rather than absolute:
+So relevance is judged in two steps:
 
 1. **Over-fetch.** The RPC pulls 30 candidates with the threshold disabled
    (`-1.0`). You cannot distinguish "the best match was weak" from "we
    truncated the good hits" if you only ever fetch 8.
-2. **Absolute floor** (`0.35`). Catches the case where nothing in the corpus
-   is remotely related, so the system abstains instead of hallucinating. It
-   has to sit above the score an unrelated pair typically gets (0.15-0.35)
-   and below a genuinely related pair (0.50-0.85).
-3. **Relative delta** (`0.12`). Keeps only chunks within `0.12` of the
-   best-scoring hit for *this* query.
+2. **Absolute floor** (`0.65`). Just above the measured noise ceiling of
+   0.637 and below the weakest true match of 0.715. Catches the case where
+   nothing in the corpus is remotely related, so the system abstains
+   instead of hallucinating.
+3. **Relative delta** (`0.10`). Keeps only chunks within `0.10` of the
+   best-scoring hit for *this* query. Measured average top-2 margin was
+   0.084.
 4. **Model abstention.** The system prompt instructs the model to reply
    `INSUFFICIENT_CONTEXT` when the provided context does not answer the
    question. This is the real safety net - it does not depend on the
    threshold being right.
 
 All four values live in `src/lib/constants.ts`.
+
+### Calibrating the thresholds
+
+The thresholds above are **measured, not guessed**, but they came from six
+chunks of a single SOP. Re-run the calibration against the real corpus:
+
+```bash
+npx tsx scripts/calibrate-retrieval.ts
+```
+
+It reports top-1 accuracy, the weakest true score, the strongest noise
+score, and the resulting threshold window.
 
 ### Post-MVP improvement
 
@@ -92,6 +127,14 @@ is likely a larger quality win - OpenRouter exposes a Rerank endpoint.
 | `/api/ingest` | POST | Multipart upload. Parses, chunks, embeds, inserts. |
 | `/api/documents` | GET / DELETE | List documents; delete one and its chunks. |
 
+## Notes on the model choice
+
+The spec called for Claude 3.5 Sonnet. That model has been retired by
+Anthropic and is no longer in OpenRouter's catalog. The default is now
+Gemini `gemini-4-hydrogen` (free tier), and OpenRouter's
+`anthropic/claude-3.5-sonnet` is available by setting
+`AI_PROVIDER=openrouter` with a funded key.
+
 ## Project layout
 
 ```
@@ -107,11 +150,14 @@ src/
     upload/                      # dropzone, document table
     ui/                          # shadcn-style primitives
   lib/
-    openrouter/                  # embeddings + chat clients
-    parsers/                     # markdown, text (registry)
-    rag/                         # chunk, retrieve, prompt, pipeline
+    ai.ts                        # provider dispatcher
+    gemini/                      # Gemini embeddings + chat
+    openrouter/                  # OpenRouter embeddings + chat
+    parsers/                     # markdown, text, pdf (registry)
+    rag/                         # chunk, retrieve, prompt, pipeline, ingest
     supabase/                    # client, server, admin
 supabase/migrations/             # schema, RPC, RLS, storage
+scripts/                         # calibration, probes, CLI ingest
 ```
 
 ## Scripts
@@ -122,18 +168,19 @@ npm run build          # production build
 npm run lint           # eslint
 npm run typecheck      # tsc --noEmit
 npm test               # vitest
-npm run ingest:cli -- ./sops   # bulk-ingest a folder of .md/.txt files
+npm run ingest:cli -- ./sops   # bulk-ingest a folder of .md/.txt/.pdf files
+
+npx tsx scripts/calibrate-retrieval.ts   # measure threshold windows
+npx tsx scripts/probe-gemini.ts           # verify key, models, dimension
+npx tsx scripts/list-gemini-models.ts     # models available to the key
 ```
 
-## Notes on the model choice
+## Supported input formats
 
-The spec called for Claude 3.5 Sonnet. That model has been retired by
-Anthropic and is no longer in OpenRouter's catalog. The default here is
-`anthropic/claude-sonnet-4.5`, the current stable Sonnet generation, and it
-is overridable via `OPENROUTER_CHAT_MODEL` without a code change.
+Markdown (`.md`), plain text (`.txt`), and PDF (`.pdf`).
 
-Embeddings use `openai/text-embedding-3-small` at 1536 dimensions, served
-through OpenRouter's `/embeddings` endpoint. If you switch embedding models,
-`EMBEDDING_DIMENSIONS` in `src/lib/constants.ts` and the `vector(N)` column
-in `supabase/migrations/20240101000002_protocol_chunks.sql` must change
-together.
+PDF chunks are page-aware, so a citation reads "SOP-1142 - page 7" and can
+be checked against the printed protocol. Headings are detected heuristically
+so a chunk maps to a named SOP section where the text layer allows it.
+Scanned PDFs with no text layer are rejected with an actionable message
+rather than silently producing empty chunks.

@@ -1,6 +1,6 @@
 import "server-only";
 
-import { CHAT_MODEL } from "@/lib/constants";
+import { OPENROUTER_CHAT_MODEL } from "@/lib/constants";
 import { openRouterFetch } from "@/lib/openrouter/client";
 
 /**
@@ -42,7 +42,7 @@ export async function* streamChat(
   messages: ChatMessage[],
   options: StreamChatOptions = {},
 ): AsyncGenerator<string> {
-  const model = options.model ?? CHAT_MODEL;
+  const model = options.model ?? OPENROUTER_CHAT_MODEL;
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -84,6 +84,10 @@ export async function* streamChat(
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
+
+      // Normalise CRLF to LF so frame splitting works regardless of the
+      // provider's line endings.
+      buffer = buffer.replace(/\r\n/g, "\n");
 
       // SSE frames are separated by a blank line.
       let boundary = buffer.indexOf("\n\n");
@@ -133,7 +137,7 @@ export async function completeChat(
   messages: ChatMessage[],
   options: StreamChatOptions = {},
 ): Promise<string> {
-  const model = options.model ?? CHAT_MODEL;
+  const model = options.model ?? OPENROUTER_CHAT_MODEL;
 
   const response = await openRouterFetch<{
     choices?: Array<{ message?: { content?: string } }>;

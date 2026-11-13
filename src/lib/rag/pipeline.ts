@@ -1,7 +1,6 @@
 import "server-only";
 
-import { embedQuery } from "@/lib/openrouter/embeddings";
-import { streamChat } from "@/lib/openrouter/chat";
+import { embedQuery, streamChat } from "@/lib/ai";
 import { buildMessages } from "@/lib/rag/prompt";
 import { retrieveChunks } from "@/lib/rag/retrieve";
 import type { Citation } from "@/types/database";
