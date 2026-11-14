@@ -30,6 +30,52 @@ export type GeminiFetchOptions = {
   apiKey: string;
 };
 
+/**
+ * True when Gemini refused because of the quota rather than because of a
+ * bad request.
+ */
+export function isRateLimited(status: number, body: string): boolean {
+  if (status === 429) return true;
+
+  const text = body.toLowerCase();
+  return (
+    text.includes("quota") ||
+    text.includes("rate limit") ||
+    text.includes("resource_exhausted")
+  );
+}
+
+/** The message a technician sees instead of a raw quota payload. */
+export const RATE_LIMIT_MESSAGE =
+  "Rate limit reached - please wait and try again.";
+
+/**
+ * Turns a failed Gemini response into a message worth reading.
+ *
+ * Gemini explains its refusals in a JSON payload that runs to several
+ * lines - model retirement notices, quota windows, service states. None of
+ * that belongs in an error card: the technician needs one sentence, and
+ * the payload belongs in the server log.
+ */
+export function readableError(status: number, body: string): string {
+  console.error(`Gemini ${status}: ${body.slice(0, 500)}`);
+
+  if (isRateLimited(status, body)) return RATE_LIMIT_MESSAGE;
+  if (status === 401 || status === 403) {
+    return "The Gemini API key was rejected - check GEMINI_API_KEY.";
+  }
+  if (status === 404) {
+    return "That Gemini model is not available to this account - check the model id.";
+  }
+  if (status === 400) {
+    return "Gemini rejected the request - the question or context may be too long.";
+  }
+  if (status >= 500) {
+    return "Gemini is busy right now - please try again.";
+  }
+  return `The Gemini request failed (HTTP ${status}).`;
+}
+
 export async function geminiFetch<T>(
   path: string,
   options: GeminiFetchOptions,
@@ -47,7 +93,7 @@ export async function geminiFetch<T>(
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new GeminiError(
-      `Gemini request failed (${response.status}) for ${path}: ${text.slice(0, 500)}`,
+      readableError(response.status, text),
       response.status,
       text,
     );

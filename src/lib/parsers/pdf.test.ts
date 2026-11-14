@@ -116,4 +116,34 @@ describe("parsePdf with a realistic SOP", () => {
       chunks.map((_, index) => index),
     );
   });
+
+  it("records where each chunk sits on the page", async () => {
+    const chunks = await parsePdf(loadSopFixture());
+
+    for (const chunk of chunks) {
+      const rects = chunk.metadata.rects;
+
+      // One rectangle per line of the chunk, so the viewer can mark the
+      // exact lines that were embedded.
+      expect(rects.length).toBe(chunk.content.split("\n").length);
+
+      for (const rect of rects) {
+        expect(rect.width).toBeGreaterThan(0);
+        expect(rect.height).toBeGreaterThan(0);
+        expect(rect.x).toBeGreaterThanOrEqual(0);
+        expect(rect.y).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  it("does not repeat the heading in the chunk text", async () => {
+    const chunks = await parsePdf(loadSopFixture());
+
+    const chunk = chunks.find(
+      (c) => c.metadata.heading === "4. SAFETY REQUIREMENTS",
+    );
+
+    expect(chunk).toBeDefined();
+    expect(chunk?.content.match(/SAFETY REQUIREMENTS/g)).toHaveLength(1);
+  });
 });

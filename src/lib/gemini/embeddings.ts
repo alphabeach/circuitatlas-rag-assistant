@@ -5,7 +5,11 @@ import {
   GEMINI_EMBEDDING_MODEL,
 } from "@/lib/constants";
 import { requireEnv } from "@/lib/env";
-import { geminiFetch, withRetry } from "@/lib/gemini/client";
+import {
+  geminiFetch,
+  GeminiError,
+  withRetry,
+} from "@/lib/gemini/client";
 
 /**
  * Gemini embeddings.
@@ -107,11 +111,15 @@ export async function embedBatchGemini(
 
     return vectors;
   } catch (error) {
-    throw new GeminiEmbeddingError(
-      `Failed to embed ${input.length} text(s) via Gemini: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-      error,
-    );
+    // The Gemini message is already a readable sentence (quota, retired
+    // model, busy service); wrapping it only makes it longer.
+    const message =
+      error instanceof GeminiError
+        ? error.message
+        : `Failed to embed ${input.length} text(s) via Gemini: ${
+            error instanceof Error ? error.message : String(error)
+          }`;
+
+    throw new GeminiEmbeddingError(message, error);
   }
 }

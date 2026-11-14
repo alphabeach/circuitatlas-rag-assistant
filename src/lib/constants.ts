@@ -23,12 +23,25 @@ export const GEMINI_EMBEDDING_MODEL =
 /**
  * Gemini chat model.
  *
- * `gemini-4-hydrogen` is the current flash-tier model on the free tier.
- * The 3.x-flash models return 503 (free-tier capacity) for new accounts,
- * and 2.5-flash is retired for new users.
+ * The `-latest` alias is deliberate: versioned ids get retired for new
+ * accounts, and a retired id answers 404 "no longer available to new
+ * users" (that is what happened to gemini-2.5-flash-lite and
+ * gemini-2.5-flash). The alias follows whatever the current lite release
+ * is, which is the high-throughput model on the free tier.
  */
 export const GEMINI_CHAT_MODEL =
-  process.env.GEMINI_CHAT_MODEL ?? "gemini-4-hydrogen";
+  process.env.GEMINI_CHAT_MODEL ?? "gemini-flash-lite-latest";
+
+/**
+ * The model to fall back to when the primary one is unavailable.
+ *
+ * The free tier serves different models from different pools, so a model
+ * that is busy or out of quota falls back to another one instead of
+ * failing the request. Verified against the account's key; override with
+ * GEMINI_CHAT_FALLBACK_MODEL when it is retired.
+ */
+export const GEMINI_CHAT_FALLBACK_MODEL =
+  process.env.GEMINI_CHAT_FALLBACK_MODEL ?? "gemini-3.6-flash";
 
 /** OpenRouter embedding model. */
 export const OPENROUTER_EMBEDDING_MODEL =

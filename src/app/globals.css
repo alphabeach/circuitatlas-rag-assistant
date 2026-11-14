@@ -127,6 +127,35 @@
 
 @layer components {
   /*
+   * The PDF text layer: one element per text run of the page, placed over
+   * the canvas. The text itself is transparent - the canvas shows the
+   * printed glyphs - so a background on a run marks the line without
+   * hiding it.
+   */
+  .textLayer {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    opacity: 1;
+    line-height: 1;
+    text-size-adjust: none;
+    forced-color-adjust: none;
+    transform-origin: 0 0;
+  }
+
+  .textLayer :is(span, br) {
+    color: transparent;
+    position: absolute;
+    white-space: pre;
+    cursor: text;
+    transform-origin: 0% 0%;
+  }
+
+  .textLayer :is(span, br)::selection {
+    background: rgb(59 130 246 / 0.35);
+  }
+
+  /*
    * Markdown rendering for AI answers. Kept scoped to `.prose-answer` so it
    * cannot leak into other surfaces.
    */
@@ -215,23 +244,5 @@
     color: var(--primary);
     text-decoration: underline;
     text-underline-offset: 3px;
-  }
-
-  .prose-answer table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.9em;
-  }
-
-  .prose-answer th,
-  .prose-answer td {
-    border: 1px solid var(--border);
-    padding: 0.5em 0.7em;
-    text-align: left;
-  }
-
-  .prose-answer th {
-    background-color: var(--muted);
-    font-weight: 600;
   }
 }

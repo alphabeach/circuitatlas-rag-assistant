@@ -1,8 +1,8 @@
 import "server-only";
 
-import { GEMINI_CHAT_MODEL } from "@/lib/constants";
+import { GEMINI_CHAT_FALLBACK_MODEL, GEMINI_CHAT_MODEL } from "@/lib/constants";
 import { requireEnv } from "@/lib/env";
-import { GeminiError, withRetry } from "@/lib/gemini/client";
+import { GeminiError, readableError, withRetry } from "@/lib/gemini/client";
 
 /**
  * Gemini streaming chat.
@@ -26,6 +26,8 @@ export class GeminiChatError extends Error {
 
 export type StreamChatOptions = {
   model?: string;
+  /** Used when the primary model fails. */
+  fallbackModel?: string | null;
   signal?: AbortSignal;
   maxTokens?: number;
   temperature?: number;
@@ -37,7 +39,6 @@ export async function* streamChatGemini(
 ): AsyncGenerator<string> {
   const apiKey = requireEnv("GEMINI_API_KEY");
   const model = options.model ?? GEMINI_CHAT_MODEL;
-
   const systemText = messages
     .filter((message) => message.role === "system")
     .map((message) => message.content)
@@ -67,9 +68,9 @@ export async function* streamChatGemini(
    * The throw has to happen inside the retried function - returning a 503
    * Response and checking it afterwards would never trigger a retry.
    */
-  const fetchStream = async (): Promise<Response> => {
+  const fetchStream = async (modelId: string): Promise<Response> => {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:streamGenerateContent?alt=sse`,
       {
         method: "POST",
         headers: {
@@ -84,7 +85,7 @@ export async function* streamChatGemini(
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       throw new GeminiChatError(
-        `Gemini chat request failed (${response.status}): ${text.slice(0, 500)}`,
+        readableError(response.status, text),
         response.status,
       );
     }
@@ -95,17 +96,29 @@ export async function* streamChatGemini(
   // The free tier serves flash models from a shared pool that returns 503
   // ("high demand") fairly often, and 429 when the per-minute quota is hit.
   // Both are worth retrying.
-  const response = await withRetry(fetchStream, {
+  const retry = {
     attempts: 4,
     baseDelayMs: 2000,
-    isRetryable: (error) =>
+    isRetryable: (error: unknown) =>
       error instanceof GeminiChatError &&
       (error.status === 429 ||
         error.status === 500 ||
         error.status === 502 ||
         error.status === 503 ||
         error.status === 504),
-  });
+  };
+
+  let response: Response;
+  try {
+    response = await withRetry(() => fetchStream(model), retry);
+  } catch (error) {
+    // The primary model can be busy or not enabled for the account. The
+    // fallback is a different pool, so it is worth one more try.
+    const fallback = options.fallbackModel ?? GEMINI_CHAT_FALLBACK_MODEL;
+    if (!fallback || fallback === model) throw error;
+
+    response = await withRetry(() => fetchStream(fallback), retry);
+  }
 
   if (!response.body) {
     throw new GeminiChatError("Gemini chat response had no body");
@@ -146,7 +159,7 @@ export async function* streamChatGemini(
           candidates?: Array<{
             content?: { parts?: Array<{ text?: string; thought?: boolean }> };
           }>;
-          error?: { message?: string };
+          error?: { code?: number; message?: string; status?: string };
         };
         try {
           parsed = JSON.parse(payload);
@@ -154,8 +167,14 @@ export async function* streamChatGemini(
           continue;
         }
 
-        if (parsed.error?.message) {
-          throw new GeminiError(parsed.error.message, 400, payload);
+        if (parsed.error) {
+          // In-stream failures carry the same JSON shape as a failed
+          // response, including the numeric HTTP-ish code.
+          throw new GeminiError(
+            readableError(parsed.error.code ?? 500, payload),
+            parsed.error.code ?? 500,
+            payload,
+          );
         }
 
         for (const part of parsed.candidates?.[0]?.content?.parts ?? []) {

@@ -1,9 +1,9 @@
 import "server-only";
 
-import { extractText, getDocumentProxy } from "unpdf";
+import { extractTextItems, getDocumentProxy } from "unpdf";
 
 import { CHUNK_SIZE_CHARS } from "@/lib/constants";
-import { splitBySize } from "@/lib/rag/chunk";
+import type { PdfRect } from "@/types/database";
 
 /**
  * PDF parsing.
@@ -16,10 +16,24 @@ import { splitBySize } from "@/lib/rag/chunk";
  *    arbitrary byte offset, which is what a technician needs to verify a
  *    claim against a printed SOP.
  *
- *  - Pages are grouped into chunks on the size budget. If a PDF has
- *    detectable headings (many SOPs exported from a template do), they are
- *    picked up as section boundaries so the chunk still maps to a named
- *    section. Otherwise the chunk is labelled by its page range.
+ *  - Every chunk also keeps the RECTANGLES of the lines it contains, in
+ *    PDF points. That is what lets the UI draw the answer on the page
+ *    itself instead of showing a list of text snippets.
+ *
+ *  - Headings are detected from FONT SIZE, not from text patterns.
+ *
+ * Why font size: a line-pattern heuristic cannot tell a section title from
+ * a numbered procedure step. In a real SOP, "AUTOCLAVE" and
+ * "3. All samples must be wrapped in appropriate material" both look like
+ * short lines starting with a digit - but the first is set at 14pt and the
+ * second at 11pt, the same size as its surrounding body text. Font size is
+ * the signal a human uses, so it is the signal the parser uses.
+ *
+ * The body size is computed PER PAGE, because it varies between sections:
+ * in one real SOP the body is 14pt on the introduction, 12pt in the safety
+ * section and 11pt in the instrument procedures. A global threshold would
+ * either miss every heading in the 11pt section or label the whole 14pt
+ * introduction as headings.
  *
  * Scanned/image-only PDFs have no text layer. Those are detected and
  * rejected with a clear message rather than silently producing empty
@@ -33,105 +47,292 @@ export class PdfParseError extends Error {
   }
 }
 
-/** A page's extracted text. */
-type PageText = {
-  pageNumber: number;
+/** A reconstructed line of text with the font size it was set at. */
+type PageLine = {
   text: string;
+  fontSize: number;
+  /** Vertical position of the baseline, in PDF coordinates (origin bottom-left). */
+  y: number;
+  /** The area the line's glyphs occupy, in PDF points. */
+  rect: PdfRect;
 };
 
-const HEADING_MAX_LENGTH = 90;
+type TextItem = {
+  str: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fontSize: number;
+  fontFamily: string;
+  dir: string;
+  hasEOL: boolean;
+};
+
+const HEADING_MAX_LENGTH = 120;
 
 /**
- * Decides whether a line of extracted PDF text is a section heading.
+ * A line counts as a heading when it is set at least this many points
+ * larger than the page's body text.
  *
- * Heuristics, in priority order:
- *
- *  1. Top-level numbering: "3. Procedure" but NOT "3.1 Pellet the cells".
- *     In SOPs, single-level numbers are sections and dotted numbers are
- *     procedure steps. Steps must not be treated as headings or every
- *     chunk would be labelled with a step number.
- *  2. ALL CAPS: "4. SAFETY REQUIREMENTS".
- *  3. Short Title Case: "Purpose", "Acceptance Criteria".
- *
- * Deliberately conservative - a false positive means a chunk is labelled
- * with the wrong section name, which is worse than falling back to a page
- * range.
+ * 1.5pt, not half a point: in a real SOP the body is 11pt and the step
+ * titles ("1) INSPECT THE OVEN") are 12pt - one point up, and they are
+ * steps, not sections. Real section titles sit two to four points above
+ * the body. A half-point tolerance turned every step into a section.
  */
-function isHeadingLine(line: string): boolean {
-  if (!line || line.length > HEADING_MAX_LENGTH) return false;
-  // A heading is not a sentence.
-  if (/[.!?;]$/.test(line)) return false;
-  // Bullets and list markers are content, not headings.
-  if (/^[-*\u2022]/.test(line)) return false;
+const HEADING_SIZE_EPSILON = 1.5;
 
-  // 1. Top-level numbering only: "3. Procedure". Requires the space after
-  //    the period, which excludes dotted steps like "3.1 Pellet ...".
-  if (/^\d+\.\s+\S/.test(line)) return true;
+/**
+ * A line is treated as page furniture (a running header or footer) when it
+ * sits in the outer 8% of the page's text block.
+ */
+const FURNITURE_BAND = 0.08;
 
-  // 2. ALL CAPS.
-  if (line.length >= 3 && line === line.toUpperCase() && /[A-Z]/.test(line)) {
-    return true;
+/**
+ * A repeated line is only treated as furniture once it has appeared on at
+ * least this many pages. Three is enough to distinguish a running header
+ * from a legitimately repeated line.
+ */
+const FURNITURE_MIN_PAGES = 3;
+
+/** Bullet and list markers that indicate a body line, not a heading. */
+const BULLET_RE = /^[-*\u2022\u2013\u00b7\u25cf\u25aa\u2043]/;
+
+/**
+ * How much of the font size sits below the baseline.
+ *
+ * PDF.js reports the baseline and the font size, not the glyph box, so the
+ * box is approximated from the font metrics: most fonts put roughly a
+ * quarter of the em below the baseline and the rest above it.
+ */
+const DESCENT_RATIO = 0.22;
+
+/**
+ * Reconstructs lines from positioned text items.
+ *
+ * Uses PDF.js's own `hasEOL` signal rather than grouping by y coordinate,
+ * because y-grouping merges the columns of a two-column layout into
+ * interleaved single lines.
+ */
+function buildLines(items: TextItem[]): PageLine[] {
+  const lines: PageLine[] = [];
+
+  let parts: string[] = [];
+  let maxFontSize = 0;
+  let y = 0;
+  let left = Number.POSITIVE_INFINITY;
+  let right = Number.NEGATIVE_INFINITY;
+  let fontSize = 0;
+
+  const flush = () => {
+    const text = parts.join("").trim();
+    if (text) {
+      lines.push({
+        text,
+        fontSize: maxFontSize,
+        y,
+        rect: {
+          x: round(left),
+          y: round(y - fontSize * DESCENT_RATIO),
+          width: round(right - left),
+          height: round(fontSize),
+        },
+      });
+    }
+    parts = [];
+    maxFontSize = 0;
+    y = 0;
+    left = Number.POSITIVE_INFINITY;
+    right = Number.NEGATIVE_INFINITY;
+    fontSize = 0;
+  };
+
+  for (const item of items) {
+    if (item.str) {
+      parts.push(item.str);
+      if (item.fontSize > maxFontSize) maxFontSize = item.fontSize;
+      if (item.height > fontSize) fontSize = item.height;
+      // The baseline comes from the first item of the line; the other items
+      // of the line share it.
+      if (parts.length === 1) y = item.y;
+      left = Math.min(left, item.x);
+      right = Math.max(right, item.x + item.width);
+    }
+    if (item.hasEOL) flush();
   }
 
-  // 3. Short Title Case.
-  const isTitleCase =
-    /^[A-Z][a-zA-Z0-9\s()\-/'".:]{2,}$/.test(line) &&
-    line.split(/\s+/).filter(Boolean).length <= 8;
-  return isTitleCase;
+  // A final line without a trailing EOL marker.
+  flush();
+
+  return lines;
+}
+
+/** Rounds to two decimals - enough for a highlight, small enough for jsonb. */
+function round(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/** Normalises text so "3Foo" and "3 Foo" compare equal. */
+function normalizeForComparison(text: string): string {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 /**
- * Splits a page's text into sections keyed by the headings within it.
+ * The key a line is compared by when hunting for running furniture.
  *
- * Text before the first heading becomes an unnamed leading section.
+ * Page numbers are dropped: "Page 1", "Page 2" and "Page 3" are the same
+ * running header, but as written they never match each other, so the
+ * header survives on every page.
  */
-function splitPageIntoSections(text: string): Array<{
+function furnitureKey(text: string): string {
+  return normalizeForComparison(text.replace(/\d+/g, ""));
+}
+
+/**
+ * Finds running headers and footers.
+ *
+ * Real documents repeat a header on every page - "Laboratory Safety Policies
+ * and Standard Operating Procedures 2024" with the page number glued to the
+ * front. Left alone, each one is detected as a heading and splits the page
+ * into a useless section.
+ *
+ * A line qualifies when it sits in the outer band of the page's text block
+ * and the same text appears on several pages.
+ */
+function findRunningFurniture(
+  pageLines: PageLine[][],
+): Set<string> {
+  const occurrences = new Map<string, Set<number>>();
+
+  pageLines.forEach((lines, pageIndex) => {
+    if (lines.length === 0) return;
+
+    const ys = lines.map((line) => line.y);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const span = maxY - minY;
+    if (span <= 0) return;
+
+    const band = span * FURNITURE_BAND;
+
+    for (const line of lines) {
+      const inHeader = line.y >= maxY - band;
+      const inFooter = line.y <= minY + band;
+      if (!inHeader && !inFooter) continue;
+
+      const key = furnitureKey(line.text);
+      if (!key) continue;
+
+      const pages = occurrences.get(key) ?? new Set<number>();
+      pages.add(pageIndex);
+      occurrences.set(key, pages);
+    }
+  });
+
+  const furniture = new Set<string>();
+  for (const [key, pages] of occurrences) {
+    if (pages.size >= FURNITURE_MIN_PAGES) {
+      furniture.add(key);
+    }
+  }
+
+  return furniture;
+}
+
+/**
+ * The body font size for a page: the size covering the most characters.
+ *
+ * Weighted by character count rather than counting lines, because a page
+ * with a two-line heading and forty lines of body text should report the
+ * body size, not the heading size.
+ */
+function bodyFontSize(lines: PageLine[]): number {
+  const weights = new Map<number, number>();
+
+  for (const line of lines) {
+    const key = Math.round(line.fontSize * 2) / 2;
+    weights.set(key, (weights.get(key) ?? 0) + line.text.length);
+  }
+
+  let bestSize = lines[0]?.fontSize ?? 0;
+  let bestWeight = -1;
+
+  for (const [size, weight] of weights) {
+    if (weight > bestWeight) {
+      bestWeight = weight;
+      bestSize = size;
+    }
+  }
+
+  return bestSize;
+}
+
+/** A run of lines that belong to one section. */
+type PageSection = {
   heading: string | null;
-  body: string;
-}> {
-  const lines = text.split("\n");
-  const sections: Array<{ heading: string | null; body: string[] }> = [];
+  lines: PageLine[];
+};
 
-  let current: { heading: string | null; body: string[] } = {
-    heading: null,
-    body: [],
-  };
+/**
+ * A page's lines, split into sections at heading boundaries.
+ *
+ * A line is a heading when its font size exceeds the page's body size.
+ * The heading line itself is the first line of its section, so the text is
+ * stored once and the highlight covers the title as well as the body.
+ */
+function splitPageIntoSections(lines: PageLine[]): PageSection[] {
+  const bodySize = bodyFontSize(lines);
 
-  // A section is worth keeping if it has a heading, a body, or both.
-  const hasContent = (section: {
-    heading: string | null;
-    body: string[];
-  }) =>
-    Boolean(section.heading) || section.body.join("\n").trim().length > 0;
+  const sections: PageSection[] = [];
+  let current: PageSection = { heading: null, lines: [] };
 
-  for (const raw of lines) {
-    const line = raw.trim();
-    const isHeading = isHeadingLine(line);
+  for (const line of lines) {
+    const isHeading =
+      line.fontSize > bodySize + HEADING_SIZE_EPSILON &&
+      line.text.length <= HEADING_MAX_LENGTH &&
+      // A bulleted line is body text that happens to be set slightly
+      // larger, not a section heading.
+      !BULLET_RE.test(line.text);
 
     if (isHeading) {
-      if (hasContent(current)) {
-        sections.push({ heading: current.heading, body: current.body });
-      }
-      current = { heading: line, body: [] };
+      if (current.heading || current.lines.length > 0) sections.push(current);
+      current = { heading: line.text, lines: [line] };
       continue;
     }
 
-    current.body.push(raw);
+    current.lines.push(line);
   }
 
-  if (hasContent(current)) {
-    sections.push({ heading: current.heading, body: current.body });
+  sections.push(current);
+
+  return sections;
+}
+
+/**
+ * Packs lines into chunks of at most `maxChars` characters.
+ *
+ * Lines are never split, so every chunk keeps a known set of rectangles
+ * and the highlight lands exactly on the text that was embedded.
+ */
+function packLines(lines: PageLine[], maxChars: number): PageLine[][] {
+  const packs: PageLine[][] = [];
+  let current: PageLine[] = [];
+  let length = 0;
+
+  for (const line of lines) {
+    const cost = line.text.length + 1;
+    if (current.length > 0 && length + cost > maxChars) {
+      packs.push(current);
+      current = [];
+      length = 0;
+    }
+    current.push(line);
+    length += cost;
   }
 
-  return sections.map((section) => {
-    const body = section.body.join("\n").trim();
-    // A heading with no body is still content - it is the only text on
-    // some pages (a section title, a figure caption).
-    return {
-      heading: section.heading,
-      body: body || (section.heading ?? ""),
-    };
-  });
+  if (current.length > 0) packs.push(current);
+
+  return packs;
 }
 
 export type PdfChunk = {
@@ -142,6 +343,8 @@ export type PdfChunk = {
     page: number | null;
     pageEnd: number | null;
     ordinal: number;
+    /** Where the chunk's lines sit on the page, in PDF points. */
+    rects: PdfRect[];
   };
 };
 
@@ -169,15 +372,28 @@ export async function parsePdf(buffer: Uint8Array): Promise<PdfChunk[]> {
     );
   }
 
-  const { text } = await extractText(pdf, { mergePages: false });
-  const pages: PageText[] = (Array.isArray(text) ? text : [text]).map(
-    (pageText, index) => ({
-      pageNumber: index + 1,
-      text: pageText ?? "",
-    }),
+  // Pass the document proxy rather than the buffer: getDocumentProxy
+  // detaches the ArrayBuffer it is given.
+  const { items: pagesOfItems } = await extractTextItems(pdf);
+
+  const pageLines: PageLine[][] = pagesOfItems.map((items) =>
+    buildLines(items as TextItem[]),
   );
 
-  const totalChars = pages.reduce((sum, page) => sum + page.text.length, 0);
+  // Drop running headers and footers before anything else, so they are
+  // neither mistaken for headings nor embedded in chunk text.
+  const furniture = findRunningFurniture(pageLines);
+  const contentLines: PageLine[][] =
+    furniture.size === 0
+      ? pageLines
+      : pageLines.map((lines) =>
+          lines.filter((line) => !furniture.has(furnitureKey(line.text))),
+        );
+
+  const totalChars = contentLines.reduce(
+    (sum, lines) => sum + lines.reduce((n, line) => n + line.text.length, 0),
+    0,
+  );
 
   // A PDF with essentially no extractable text is almost certainly a scan.
   //
@@ -185,7 +401,7 @@ export async function parsePdf(buffer: Uint8Array): Promise<PdfChunk[]> {
   // zero characters, while a legitimately terse page (a title page, a
   // figure caption) still yields a handful. Only a corpus that averages
   // fewer than ~5 characters per page has no usable text layer.
-  const scanThreshold = Math.max(pages.length * 5, 10);
+  const scanThreshold = Math.max(contentLines.length * 5, 10);
   if (totalChars < scanThreshold) {
     throw new PdfParseError(
       "This PDF has no extractable text layer, so it appears to be a scanned image. " +
@@ -197,36 +413,37 @@ export async function parsePdf(buffer: Uint8Array): Promise<PdfChunk[]> {
   const chunks: PdfChunk[] = [];
   let ordinal = 0;
 
-  for (const page of pages) {
-    if (!page.text.trim()) continue;
+  contentLines.forEach((lines, pageIndex) => {
+    const pageNumber = pageIndex + 1;
+    if (lines.length === 0) return;
 
-    const sections = splitPageIntoSections(page.text);
+    const sections = splitPageIntoSections(lines);
 
     for (const section of sections) {
-      if (!section.body.trim()) continue;
+      if (section.lines.length === 0) continue;
 
-      // Include the heading in the chunk text so the embedding sees it.
-      const withHeading = section.heading
-        ? `${section.heading}\n\n${section.body}`
-        : section.body;
+      for (const pack of packLines(section.lines, CHUNK_SIZE_CHARS)) {
+        const content = pack
+          .map((line) => line.text)
+          .join("\n")
+          .trim();
+        if (!content) continue;
 
-      const pieces = splitBySize(withHeading, CHUNK_SIZE_CHARS);
-
-      for (const piece of pieces) {
         chunks.push({
-          content: piece.trim(),
+          content,
           metadata: {
             heading: section.heading,
             section: section.heading,
-            page: page.pageNumber,
-            pageEnd: page.pageNumber,
+            page: pageNumber,
+            pageEnd: pageNumber,
             ordinal,
+            rects: pack.map((line) => line.rect),
           },
         });
         ordinal++;
       }
     }
-  }
+  });
 
   if (chunks.length === 0) {
     throw new PdfParseError("No extractable text was found in this PDF.");

@@ -68,7 +68,12 @@ export async function ingestDocument(
     storagePath = await storeOriginalFile(document.id, input, filename);
     await supabase
       .from("protocol_documents")
-      .update({ storage_path: storagePath })
+      .update({
+        storage_path: storagePath,
+        // The address the browser opens the original file at. It points at
+        // our own route rather than a signed URL, so it never expires.
+        file_url: `/api/documents/file?id=${document.id}`,
+      })
       .eq("id", document.id);
   } catch (error) {
     console.warn(

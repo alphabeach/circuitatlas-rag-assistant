@@ -1,8 +1,24 @@
+/**
+ * A rectangle on a PDF page, in PDF points with the origin at the
+ * bottom-left of the page (the coordinate system PDF.js uses).
+ *
+ * Stored with each PDF chunk so the UI can draw the retrieved passage on
+ * the page itself.
+ */
+export type PdfRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 export type ProtocolDocument = {
   id: string;
   title: string;
   filename: string;
   storage_path: string | null;
+  /** Address the original upload is served from, for the PDF viewer. */
+  file_url: string | null;
   mime_type: string | null;
   tags: string[];
   chunk_count: number;

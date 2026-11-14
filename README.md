@@ -13,7 +13,7 @@ retrieved chunk that supports it.
 | Hosting | Vercel (serverless) |
 | Database | Supabase Postgres + `pgvector` |
 | Embeddings | Gemini `gemini-embedding-001` (768-dim) — AI Studio free tier |
-| Generation | Gemini `gemini-4-hydrogen` — AI Studio free tier |
+| Generation | Gemini `gemini-flash-lite-latest`, fallback `gemini-3.6-flash` - AI Studio free tier |
 | UI | Tailwind CSS v4, Radix primitives, `next-themes` |
 
 ### Why Gemini and not OpenRouter
@@ -125,15 +125,48 @@ is likely a larger quality win - OpenRouter exposes a Rerank endpoint.
 |---|---|---|
 | `/api/chat` | POST | SSE stream. Emits `citations`, then token `delta`s, then `done`. |
 | `/api/ingest` | POST | Multipart upload. Parses, chunks, embeds, inserts. |
-| `/api/documents` | GET / DELETE | List documents; delete one and its chunks. |
+| `/api/documents` | GET | List documents, or one document with its chunks (`?id=`). |
+| `/api/documents` | DELETE | Delete a document and its chunks (`?id=`). |
+| `/api/documents/file` | GET | The original upload, streamed back (`?id=`). |
+
+## Reading the answer in the source
+
+The workbench is one screen. On the left the answer arrives; on the right
+the protocol it came from is open, with the cited passage marked.
+
+One protocol at a time: the question is answered from the document selected
+in the pill row, so asking about a different SOP never pulls evidence out of
+the one that is already on screen. The active pill is the one being asked.
+
+Clicking a citation - the badges under the answer, or the `[1]` markers
+inside it - loads that protocol on the right at the page the claim came
+from and marks the lines that answer the question.
+
+A PDF is drawn with pdf.js: the page on a canvas, its text runs in a
+transparent text layer on top. The layer is what gets highlighted, so the
+mark lands on the printed lines rather than on a box drawn over them. The
+page is fed by `/api/documents/file`, which streams the original upload back
+from the private bucket; the address is stored on the document as `file_url`
+because a signed Supabase URL would expire.
+
+Markdown and plain text have no page to draw, so they are shown as the
+indexed text with the same passage marked. The passage is found with a
+whitespace-tolerant pattern, so the mark lands on the text even when the
+line breaks in the stored document differ from the retrieved chunk.
 
 ## Notes on the model choice
 
 The spec called for Claude 3.5 Sonnet. That model has been retired by
 Anthropic and is no longer in OpenRouter's catalog. The default is now
-Gemini `gemini-4-hydrogen` (free tier), and OpenRouter's
-`anthropic/claude-3.5-sonnet` is available by setting
-`AI_PROVIDER=openrouter` with a funded key.
+Gemini `gemini-flash-lite-latest` (free tier) with `gemini-3.6-flash` as
+the fallback, and OpenRouter's `anthropic/claude-3.5-sonnet` is available
+by setting `AI_PROVIDER=openrouter` with a funded key.
+
+Versioned Gemini ids get retired for new accounts and then answer 404
+("no longer available to new users") - that is what happened to
+`gemini-2.5-flash-lite` and `gemini-2.5-flash`. The `-latest` alias moves
+with the current lite release, so the default does not rot; set
+`GEMINI_CHAT_MODEL` / `GEMINI_CHAT_FALLBACK_MODEL` to pin one.
 
 ## Project layout
 
@@ -141,14 +174,13 @@ Gemini `gemini-4-hydrogen` (free tier), and OpenRouter's
 src/
   app/
     api/{chat,ingest,documents}/route.ts
-    upload/page.tsx              # ingestion UI
-    page.tsx                     # dashboard
+    page.tsx                     # the workbench
   components/
     chat/                        # query input, answer panel
-    citations/                   # source cards + drawer
-    layout/                      # app shell, sidebar
-    upload/                      # dropzone, document table
+    viewer/                      # protocol viewer with the cited passage marked
+    layout/                      # theme provider, theme toggle
     ui/                          # shadcn-style primitives
+    workbench/                   # split-pane shell, upload strip
   lib/
     ai.ts                        # provider dispatcher
     gemini/                      # Gemini embeddings + chat

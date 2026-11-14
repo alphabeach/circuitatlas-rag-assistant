@@ -9,10 +9,8 @@ import {
 /**
  * POST /api/ingest
  *
- * Accepts a multipart upload of one or more Markdown/text SOPs, then parses,
+ * Accepts a multipart upload of one or more SOP files, then parses,
  * chunks, embeds, and stores them.
- *
- * GET returns the list of ingested documents.
  */
 
 export const maxDuration = 60;
@@ -88,27 +86,6 @@ export async function POST(request: Request) {
     },
     { status },
   );
-}
-
-export async function GET() {
-  const { getAdminClient } = await import("@/lib/supabase/admin");
-  const supabase = getAdminClient();
-
-  const { data, error } = await supabase
-    .from("protocol_documents")
-    .select(
-      "id, title, filename, mime_type, tags, chunk_count, char_count, created_at",
-    )
-    .order("created_at", { ascending: false });
-
-  if (error) {
-    return Response.json(
-      { error: `Failed to list documents: ${error.message}` },
-      { status: 500 },
-    );
-  }
-
-  return Response.json({ documents: data ?? [] });
 }
 
 function isFile(value: FormDataEntryValue): value is File {
