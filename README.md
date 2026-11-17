@@ -2,8 +2,8 @@
 
 Retrieval-augmented assistant for laboratory SOPs. Natural-language questions
 about protocols, assays, and safety procedures are answered strictly from an
-ingested corpus of Markdown/text SOPs, with every claim traced back to the
-retrieved chunk that supports it.
+ingested corpus of Markdown, plain-text, and PDF SOPs, with every claim
+traced back to the retrieved chunk that supports it.
 
 ## Stack
 
@@ -57,14 +57,13 @@ filename order.
 
 ## Supported input formats
 
-**Markdown (`.md`) and plain text (`.txt`) only.** PDF ingestion is
-deliberately out of scope for the MVP.
+Markdown (`.md`), plain text (`.txt`), and PDF (`.pdf`).
 
-The reason is not that PDF parsing is impossible on serverless - it is that
-Markdown gives better retrieval. Headings become real chunk boundaries, so a
-retrieved chunk maps to an actual SOP section rather than an arbitrary slice
-of a flattened text stream. Converting an existing SOP to Markdown takes
-about ten seconds and the result is permanently more searchable.
+PDF chunks are page-aware, so a citation reads "SOP-1142 - page 7" and can
+be checked against the printed protocol. Headings are detected heuristically
+so a chunk maps to a named SOP section where the text layer allows it.
+Scanned PDFs with no text layer are rejected with an actionable message
+rather than silently producing empty chunks.
 
 `src/lib/parsers/` is a registry, so adding a format later is one file.
 
@@ -118,6 +117,65 @@ re-normalizing) removes the dominant direction and makes absolute thresholds
 meaningful again. That requires a re-embedding pass, so it is parked. A
 cross-encoder **reranker** over the 30 candidates is the cheaper upgrade and
 is likely a larger quality win - OpenRouter exposes a Rerank endpoint.
+
+## Production AWS Architecture (Scaling to Messy Lab Corpora)
+
+The MVP runs on Vercel + Supabase because both are free and zero-ops. That
+stops being true when the corpus is a shared drive of scans, duplicate
+revisions, and tables. The shape below keeps the application code mostly
+intact: the parser registry, RAG pipeline, and provider dispatcher are
+already the seams the migration needs.
+
+### Target stack mapping
+
+| MVP layer | AWS target | Why |
+|---|---|---|
+| Vercel serverless routes | Amazon ECS Fargate in private subnets | Long-running ingest, no 60 s ceiling, VPC access to RDS and Bedrock |
+| Supabase Storage | Amazon S3 with SSE-KMS and versioning | Presigned upload/download, immutable object versions, no 4 MB proxy |
+| Supabase Postgres + `pgvector` | Amazon RDS for PostgreSQL with `pgvector` | Same schema and `match_protocol_chunks` RPC, private subnet, RDS Proxy for concurrency |
+| AI Studio / OpenRouter | Amazon Bedrock over a PrivateLink VPC endpoint | Protocol text never leaves the VPC; no third-party API egress |
+| Synchronous `/api/ingest` | S3 Event Notifications -> SQS -> Fargate/Lambda worker with DLQ | Upload returns immediately; retries and failures are observable |
+
+`src/lib/ai.ts` already dispatches between providers, and
+`src/lib/parsers/index.ts` already routes `.md`, `.txt`, and `.pdf` through a
+single `parseDocument` entry point. Those are the swap points, not rewrites.
+
+### Solving messy, unorganized lab corpora
+
+Shared-drive drops are not clean uploads. The normalization path is:
+
+- **Content-hash dedupe.** Hash the bytes with SHA-256 on upload and key the
+  S3 object by that hash. The same SOP dropped twice becomes one object, not
+  two documents. Objects move `raw/` -> `normalized/` -> `quarantine/`, so a
+  failed parse is kept for inspection instead of deleted.
+- **Route by format.** Native `.md`, `.txt`, and text-layer `.pdf` files go
+  through `src/lib/parsers/` exactly as they do today. Scanned or image-only
+  PDFs, and reagent tables where line extraction loses structure, go to
+  **Amazon Textract** (`TABLES` + `LAYOUT`) for text and bounding boxes.
+  Textract's per-cell coordinates are what make table citations exact; the
+  existing `rects` metadata on PDF chunks is the same idea at line level.
+- **Revision tracking.** `supersedes_document_id` and `effective_date` on the
+  document row let retrieval filter to the current revision by default while
+  keeping every superseded version auditable. A partial unique index on the
+  active revision per protocol title makes "two current versions" impossible
+  at the database level rather than in application code.
+
+### Network and data isolation
+
+- **No public ingress.** Application and database tasks run in private
+  subnets. Only the load balancer is reachable from the bench network, and
+  RDS accepts connections from the application security group only.
+- **Least-privilege IAM.** Ingestion writers can `s3:PutObject`, call
+  Textract, and write chunks. Query workers get read-only SQL, S3
+  `GetObject` on one prefix, and `bedrock:InvokeModel`. Neither role can do
+  the other's job, and no long-lived access keys exist.
+- **Secrets rotation.** Database credentials live in AWS Secrets Manager and
+  rotate on a schedule; the application reads them through RDS Proxy rather
+  than a `.env` file.
+- **Infrastructure as code.** The stack is provisioned with AWS CDK
+  (TypeScript), or Terraform if the team prefers it, and GitHub Actions runs
+  `cdk diff` / `terraform plan` on every pull request, so network and IAM
+  changes are reviewed before they are applied.
 
 ## API
 
@@ -206,13 +264,3 @@ npx tsx scripts/calibrate-retrieval.ts   # measure threshold windows
 npx tsx scripts/probe-gemini.ts           # verify key, models, dimension
 npx tsx scripts/list-gemini-models.ts     # models available to the key
 ```
-
-## Supported input formats
-
-Markdown (`.md`), plain text (`.txt`), and PDF (`.pdf`).
-
-PDF chunks are page-aware, so a citation reads "SOP-1142 - page 7" and can
-be checked against the printed protocol. Headings are detected heuristically
-so a chunk maps to a named SOP section where the text layer allows it.
-Scanned PDFs with no text layer are rejected with an actionable message
-rather than silently producing empty chunks.
